@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: pms-life-os
+    runtime: python
+    plan: free
+    buildCommand: python --version
+    startCommand: python pms_life_os_web.py
