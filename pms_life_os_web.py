@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import html
 import io
+import json
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 
 APP_TITLE = "PMS Life OS"
@@ -16,6 +18,8 @@ OWNER = "Gauravh Dallvi"
 DB_PATH = Path(__file__).with_name("pms_life_os.db")
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8501"))
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+INDIA_TZ = "+05:30"
 
 
 def connect() -> sqlite3.Connection:
@@ -37,7 +41,12 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'Open',
                 reminder_time TEXT NOT NULL,
                 recurring TEXT NOT NULL DEFAULT 'None',
+                google_event_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS followups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,6 +112,9 @@ def init_db() -> None:
             );
             """
         )
+        reminder_cols = [row["name"] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()]
+        if "google_event_id" not in reminder_cols:
+            conn.execute("ALTER TABLE reminders ADD COLUMN google_event_id TEXT")
         if conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0] == 0:
             today = date.today()
             conn.executemany(
@@ -154,6 +166,143 @@ def sync_escalations() -> int:
     return changed
 
 
+def get_setting(key: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+def google_configured() -> bool:
+    return all(
+        os.environ.get(name)
+        for name in ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"]
+    )
+
+
+def google_connected() -> bool:
+    return bool(get_setting("google_access_token") and get_setting("google_refresh_token"))
+
+
+def google_auth_url() -> str:
+    params = {
+        "client_id": os.environ["GOOGLE_CLIENT_ID"],
+        "redirect_uri": os.environ["GOOGLE_REDIRECT_URI"],
+        "response_type": "code",
+        "scope": GOOGLE_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def post_json_or_form(url: str, data: dict[str, str], as_json: bool = False) -> dict[str, object]:
+    payload = json.dumps(data).encode("utf-8") if as_json else urlencode(data).encode("utf-8")
+    headers = {"Content-Type": "application/json"} if as_json else {"Content-Type": "application/x-www-form-urlencoded"}
+    request = Request(url, data=payload, headers=headers, method="POST")
+    with urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def save_google_tokens(token_data: dict[str, object]) -> None:
+    if token_data.get("access_token"):
+        set_setting("google_access_token", str(token_data["access_token"]))
+    if token_data.get("refresh_token"):
+        set_setting("google_refresh_token", str(token_data["refresh_token"]))
+    expires_in = int(token_data.get("expires_in", 3600))
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, expires_in - 60))
+    set_setting("google_token_expires_at", expires_at.isoformat())
+
+
+def exchange_google_code(code: str) -> None:
+    token_data = post_json_or_form(
+        "https://oauth2.googleapis.com/token",
+        {
+            "code": code,
+            "client_id": os.environ["GOOGLE_CLIENT_ID"],
+            "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+            "redirect_uri": os.environ["GOOGLE_REDIRECT_URI"],
+            "grant_type": "authorization_code",
+        },
+    )
+    save_google_tokens(token_data)
+
+
+def google_access_token() -> str:
+    access_token = get_setting("google_access_token")
+    refresh_token = get_setting("google_refresh_token")
+    expires_at_value = get_setting("google_token_expires_at")
+    if access_token and expires_at_value:
+        try:
+            if datetime.fromisoformat(expires_at_value) > datetime.now(timezone.utc):
+                return access_token
+        except ValueError:
+            pass
+    if not refresh_token:
+        raise RuntimeError("Google Calendar is not connected.")
+    token_data = post_json_or_form(
+        "https://oauth2.googleapis.com/token",
+        {
+            "client_id": os.environ["GOOGLE_CLIENT_ID"],
+            "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    save_google_tokens(token_data)
+    return str(token_data["access_token"])
+
+
+def send_reminder_to_google(reminder_id: int) -> str:
+    with connect() as conn:
+        reminder = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        if not reminder:
+            raise RuntimeError("Reminder not found.")
+
+    start = f"{reminder['due_date']}T{reminder['reminder_time']}:00{INDIA_TZ}"
+    end_dt = datetime.fromisoformat(f"{reminder['due_date']}T{reminder['reminder_time']}:00") + timedelta(minutes=30)
+    event = {
+        "summary": reminder["task"],
+        "description": f"PMS Life OS reminder\nCategory: {reminder['category']}\nPriority: {reminder['priority']}",
+        "start": {"dateTime": start, "timeZone": "Asia/Kolkata"},
+        "end": {"dateTime": end_dt.isoformat() + INDIA_TZ, "timeZone": "Asia/Kolkata"},
+        "reminders": {
+            "useDefault": False,
+            "overrides": [{"method": "popup", "minutes": 10}],
+        },
+    }
+    if reminder["recurring"] == "Daily":
+        event["recurrence"] = ["RRULE:FREQ=DAILY"]
+    elif reminder["recurring"] == "Weekly":
+        event["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+    elif reminder["recurring"] == "Monthly":
+        event["recurrence"] = ["RRULE:FREQ=MONTHLY"]
+
+    token = google_access_token()
+    request = Request(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        data=json.dumps(event).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=20) as response:
+        created = json.loads(response.read().decode("utf-8"))
+
+    with connect() as conn:
+        conn.execute("UPDATE reminders SET google_event_id = ? WHERE id = ?", (created.get("id", ""), reminder_id))
+        conn.commit()
+    return str(created.get("htmlLink", ""))
+
+
 def communication_review(text: str) -> dict[str, object]:
     lower = text.lower()
     risk_terms = ["urgent", "delay", "risk", "claim", "penalty", "escalate", "failed", "pending"]
@@ -176,7 +325,13 @@ def communication_review(text: str) -> dict[str, object]:
 
 def table(headers: list[str], data: list[list[object]]) -> str:
     head = "".join(f"<th>{esc(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{esc(cell)}</td>" for cell in row) + "</tr>" for row in data)
+    def cell_html(cell: object) -> str:
+        text = "" if cell is None else str(cell)
+        if text.startswith("<a class='button'") or text.startswith('<a class="button"'):
+            return text
+        return esc(text)
+
+    body = "".join("<tr>" + "".join(f"<td>{cell_html(cell)}</td>" for cell in row) + "</tr>" for row in data)
     return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
@@ -292,6 +447,30 @@ class App(BaseHTTPRequestHandler):
             return self.send_html("Memory/Life/Content", self.memory())
         if path == "/export":
             return self.export_csv()
+        if path == "/google/connect":
+            if not google_configured():
+                return self.send_html("Google Calendar", "<div class='notice'>Google Calendar keys are missing in Render Environment settings.</div>")
+            self.redirect(google_auth_url())
+            return None
+        if path == "/oauth2callback":
+            params = parse_qs(urlparse(self.path).query)
+            if "error" in params:
+                return self.send_html("Google Calendar", f"<div class='notice'>Google returned an error: {esc(params['error'][0])}</div>")
+            if "code" not in params:
+                return self.send_html("Google Calendar", "<div class='notice'>No Google authorization code was received.</div>")
+            try:
+                exchange_google_code(params["code"][0])
+                return self.send_html("Google Calendar", "<div class='notice'>Google Calendar connected. Go back to Reminder OS and send a reminder to calendar.</div><p><a class='button' href='/reminders'>Open Reminder OS</a></p>")
+            except Exception as exc:
+                return self.send_html("Google Calendar", f"<div class='notice'>Calendar connection failed: {esc(exc)}</div>")
+        if path == "/calendar/add":
+            params = parse_qs(urlparse(self.path).query)
+            reminder_id = int(params.get("reminder_id", ["0"])[0])
+            try:
+                link = send_reminder_to_google(reminder_id)
+                return self.send_html("Google Calendar", f"<div class='notice'>Reminder saved to Google Calendar.</div><p><a class='button' href='{esc(link)}'>Open Google Calendar Event</a> <a class='button' href='/reminders'>Back to Reminders</a></p>")
+            except Exception as exc:
+                return self.send_html("Google Calendar", f"<div class='notice'>Could not save reminder to Google Calendar: {esc(exc)}</div><p><a class='button' href='/reminders'>Back to Reminders</a></p>")
         self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -361,6 +540,12 @@ class App(BaseHTTPRequestHandler):
         return content
 
     def reminders(self) -> str:
+        if not google_configured():
+            google_status = "<div class='notice'>Google Calendar is not configured yet. Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI in Render.</div>"
+        elif google_connected():
+            google_status = "<div class='notice'>Google Calendar connected. Use Send to Calendar beside any reminder.</div>"
+        else:
+            google_status = "<div class='notice'>Google Calendar is configured but not connected. <a class='button' href='/google/connect'>Connect Google Calendar</a></div>"
         form = """
         <form method="post"><div class="fields">
         <p><label>Task</label><input name="task" required></p>
@@ -371,8 +556,21 @@ class App(BaseHTTPRequestHandler):
         <p><label>Recurring</label><select name="recurring"><option>None</option><option>Daily</option><option>Weekly</option><option>Monthly</option></select></p>
         </div><button>Add Reminder</button></form>
         """
-        data = [[r["id"], r["task"], r["category"], r["priority"], r["due_date"], r["status"], r["reminder_time"], r["recurring"]] for r in rows("reminders")]
-        return form + table(["ID", "Task", "Category", "Priority", "Due", "Status", "Reminder", "Recurring"], data)
+        data = [
+            [
+                r["id"],
+                r["task"],
+                r["category"],
+                r["priority"],
+                r["due_date"],
+                r["status"],
+                r["reminder_time"],
+                r["recurring"],
+                "Saved" if r["google_event_id"] else f"<a class='button' href='/calendar/add?reminder_id={r['id']}'>Send to Calendar</a>",
+            ]
+            for r in rows("reminders")
+        ]
+        return google_status + form + table(["ID", "Task", "Category", "Priority", "Due", "Status", "Reminder", "Recurring", "Google Calendar"], data)
 
     def followups(self) -> str:
         form = """
